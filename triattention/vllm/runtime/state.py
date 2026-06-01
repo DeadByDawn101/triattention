@@ -132,6 +132,7 @@ class RequestStateStore:
             return
         state.pending_triggers = max(state.pending_triggers - 1, 0)
         state.last_trigger_reason = f"skipped:{reason}"
+        state.last_compression_step = step
 
     def remove(self, req_id: str) -> None:
         self._states.pop(req_id, None)
