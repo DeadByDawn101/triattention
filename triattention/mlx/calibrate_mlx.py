@@ -1,13 +1,25 @@
 """
 TriAttention MLX Calibration — Production-Grade
 ================================================
-Hooks into mlx-lm attention layers to capture pre‑RoPE Q activations,
-inverts RoPE, and computes per‑head complex frequency statistics.
+Hooks into mlx-lm attention layers to capture POST-RoPE Q activations,
+inverts RoPE (half-split / NeoX convention, partial-rotary aware), and
+computes per-head complex frequency statistics.
 
-Output: .npz with keys {(layer, head): {"freq_real", "freq_imag", "abs_mean"}}
+The math mirrors the canonical CUDA pipeline in ``scripts/calibrate.py``:
+  1. Hook computes q_proj → (optional) q_norm → apply RoPE → capture q_rot.
+  2. ``compute_stats`` inverts RoPE on q_rot, forms half-split complex pairs
+     over the rotated dimensions only, and reduces to per-frequency vectors:
+       - q_mean_real / q_mean_imag : [freq_count]  (complex mean)
+       - q_abs_mean                : [freq_count]  (|q|.mean, NOT scalar)
+
+``freq_count = int(partial_rotary_factor * head_dim) // 2``.  For Qwen3.5/6
+with partial_rotary_factor=0.25 and head_dim=256 → 32 frequencies.
+
+Output: .npz with per-head keys ``l_{layer}_h_{head}_{q_mean_real,q_mean_imag,q_abs_mean}``
+plus global metadata (partial_rotary_factor, rope_theta, rope_style, ...).
 
 Architecture-aware hooks for:
-  - Qwen3NextAttention (Qwen3.5/6, M‑RoPE, partial rotary, gate)
+  - Qwen3NextAttention (Qwen3.5/6, M-RoPE, partial rotary, gate)
   - GemmaAttention (Gemma 4, standard RoPE)
 
 Usage:
@@ -31,66 +43,205 @@ import mlx.core as mx
 import numpy as np
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# RoPE helpers (half-split / NeoX convention, partial-rotary aware)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ROPE_STYLE = "half"
+"""Half-split (NeoX) convention — matches the consumer's ``invert_rope_mlx``."""
+
+
+def _rotated_dim(head_dim: int, partial_rotary_factor: float) -> int:
+    """Number of leading dimensions rotated by RoPE."""
+    return max(2, int(partial_rotary_factor * head_dim))
+
+
+def build_inv_freq(
+    head_dim: int, rope_theta: float, partial_rotary_factor: float
+) -> mx.array:
+    """Build inverse frequencies for RoPE [freq_count].
+
+    ``freq_count = rotated_dim // 2`` where
+    ``rotated_dim = int(partial_rotary_factor * head_dim)``.
+    """
+    rotated_dim = _rotated_dim(head_dim, partial_rotary_factor)
+    freq_count = rotated_dim // 2
+    i = mx.arange(0, freq_count, dtype=mx.float32)
+    return 1.0 / (rope_theta ** (2 * i / rotated_dim))
+
+
+def _apply_rope(
+    q: mx.array,
+    positions: mx.array,
+    inv_freq: mx.array,
+    rotated_dim: int,
+) -> mx.array:
+    """Apply half-split RoPE to the first ``rotated_dim`` dims of ``q``.
+
+    q: [seq_len, ..., head_dim]  (positions broadcast on axis 0)
+    positions: [seq_len]
+    inv_freq: [freq_count]
+
+    Returns: q_rot [seq_len, ..., head_dim] (non-rotated tail passes through)
+    """
+    freq_count = rotated_dim // 2
+    theta = mx.outer(positions.astype(mx.float32), inv_freq.astype(mx.float32))
+    cos_t = mx.cos(theta)  # [seq_len, freq_count]
+    sin_t = mx.sin(theta)
+
+    # Broadcast cos/sin to q's shape: [seq_len, 1, ..., 1, freq_count]
+    cos_b = cos_t
+    sin_b = sin_t
+    for _ in range(q.ndim - 2):
+        cos_b = cos_b[:, None]
+        sin_b = sin_b[:, None]
+
+    q1 = q[..., :freq_count]               # [..., freq_count]
+    q2 = q[..., freq_count:rotated_dim]     # [..., freq_count]
+
+    q_rot1 = q1 * cos_b - q2 * sin_b
+    q_rot2 = q1 * sin_b + q2 * cos_b
+
+    if rotated_dim < q.shape[-1]:
+        return mx.concatenate([q_rot1, q_rot2, q[..., rotated_dim:]], axis=-1)
+    return mx.concatenate([q_rot1, q_rot2], axis=-1)
+
+
+def _invert_rope(
+    q_rot: mx.array,
+    positions: mx.array,
+    inv_freq: mx.array,
+    rotated_dim: int,
+) -> mx.array:
+    """Invert half-split RoPE on the first ``rotated_dim`` dims.
+
+    Inverse of ``_apply_rope``: q_base = invert(apply(q)) == q.
+    Non-rotated tail passes through unchanged.
+    """
+    freq_count = rotated_dim // 2
+    theta = mx.outer(positions.astype(mx.float32), inv_freq.astype(mx.float32))
+    cos_t = mx.cos(theta)  # [seq_len, freq_count]
+    sin_t = mx.sin(theta)
+
+    cos_b = cos_t
+    sin_b = sin_t
+    for _ in range(q_rot.ndim - 2):
+        cos_b = cos_b[:, None]
+        sin_b = sin_b[:, None]
+
+    q1 = q_rot[..., :freq_count]
+    q2 = q_rot[..., freq_count:rotated_dim]
+
+    # R^-1 = R^T → [cos, sin; -sin, cos]
+    q1_orig = q1 * cos_b + q2 * sin_b
+    q2_orig = -q1 * sin_b + q2 * cos_b
+
+    if rotated_dim < q_rot.shape[-1]:
+        return mx.concatenate([q1_orig, q2_orig, q_rot[..., rotated_dim:]], axis=-1)
+    return mx.concatenate([q1_orig, q2_orig], axis=-1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Data structures
 # ═══════════════════════════════════════════════════════════════════════════════
 
 LayerHeadKey = Tuple[int, int]  # (layer_idx, head_idx)
 
+
 class CapturedState:
-    """Per‑sample accumulator for Q states across attention heads."""
-    __slots__ = ("layer_idx", "q_pre_rope", "positions")
+    """Per-layer accumulator for POST-RoPE Q states and their positions."""
+    __slots__ = ("layer_idx", "q_rot_samples", "positions_samples")
+
     def __init__(self, layer_idx: int):
         self.layer_idx = layer_idx
-        self.q_pre_rope: List[mx.array] = []  # list of [num_heads, head_dim]
-        self.positions: List[mx.array] = []   # list of [seq_len]
+        self.q_rot_samples: List[mx.array] = []    # list of [seq_len, nheads, head_dim]
+        self.positions_samples: List[mx.array] = []  # list of [seq_len]
 
 
 class StatsAccumulator:
-    """Accumulates Q stats across calibration samples."""
-    def __init__(self, num_layers: int):
+    """Accumulates POST-RoPE Q states across calibration samples and computes
+    rotation-removed per-frequency statistics."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        head_dim: int,
+        rope_theta: float,
+        partial_rotary_factor: float,
+        rope_style: str = ROPE_STYLE,
+    ):
         self.num_layers = num_layers
+        self.head_dim = head_dim
+        self.rope_theta = rope_theta
+        self.partial_rotary_factor = partial_rotary_factor
+        self.rope_style = rope_style
+        self.rotated_dim = _rotated_dim(head_dim, partial_rotary_factor)
+        self.freq_count = self.rotated_dim // 2
+        self.inv_freq = build_inv_freq(head_dim, rope_theta, partial_rotary_factor)
         self._captures: Dict[int, CapturedState] = {
             i: CapturedState(i) for i in range(num_layers)
         }
 
-    def capture(self, layer_idx: int, q_pre: mx.array, positions: mx.array):
-        """Capture pre‑RoPE Q activations for one attention call."""
-        cs = self._captures[layer_idx]
-        cs.q_pre_rope.append(q_pre.astype(mx.complex64))
-        cs.positions.append(positions)
+    def capture(self, layer_idx: int, q_rot: mx.array, positions: mx.array):
+        """Capture POST-RoPE Q activations for one attention call.
 
-    def compute_stats(self) -> Dict[LayerHeadKey, Dict[str, float]]:
-        """Aggregate captured Q states into RoPE‑aware frequency statistics."""
-        stats: Dict[LayerHeadKey, Dict[str, float]] = {}
+        q_rot: [seq_len, num_heads, head_dim]
+        positions: [seq_len]
+        """
+        cs = self._captures[layer_idx]
+        cs.q_rot_samples.append(q_rot.astype(mx.float32))
+        cs.positions_samples.append(positions)
+
+    def compute_stats(self) -> Dict[LayerHeadKey, Dict[str, np.ndarray]]:
+        """Invert RoPE and compute per-frequency statistics.
+
+        Returns dict mapping (layer, head) → {
+            "q_mean_real": np.float32[freq_count],
+            "q_mean_imag": np.float32[freq_count],
+            "q_abs_mean":  np.float32[freq_count],   # per-frequency, NOT scalar
+        }
+        """
+        stats: Dict[LayerHeadKey, Dict[str, np.ndarray]] = {}
 
         for layer_idx, cs in self._captures.items():
-            if not cs.q_pre_rope:
+            if not cs.q_rot_samples:
                 continue
 
-            # Stack all samples: [total_tokens, num_heads, head_dim]
-            all_q = mx.concatenate(cs.q_pre_rope, axis=0)   # [T, n_heads, head_dim]
+            # Invert RoPE per-sample (each has its own positions), then concat.
+            q_base_chunks: List[mx.array] = []
+            for q_rot, positions in zip(cs.q_rot_samples, cs.positions_samples):
+                q_base = _invert_rope(
+                    q_rot, positions, self.inv_freq, self.rotated_dim
+                )
+                q_base_chunks.append(q_base)
+
+            all_q = mx.concatenate(q_base_chunks, axis=0)  # [T, nheads, head_dim]
             T, num_heads, head_dim = all_q.shape
 
             for head_idx in range(num_heads):
                 q_head = all_q[:, head_idx, :]  # [T, head_dim]
-                mean_complex = q_head.mean(axis=0)  # [head_dim]
 
-                # Invert RoPE — isolate the real frequency component
-                # RoPE pairs dimensions: even = real, odd = imag
-                head_dim_half = head_dim // 2
-                freq_real = mean_complex[0 : 2 * head_dim_half : 2]
-                freq_imag = mean_complex[1 : 2 * head_dim_half : 2]
+                # Half-split complex pairs on rotated dims only.
+                q_rotated = q_head[:, :self.rotated_dim]  # [T, rotated_dim]
+                real = q_rotated[:, :self.freq_count].astype(mx.float32)  # [T, freq_count]
+                imag = q_rotated[:, self.freq_count:].astype(mx.float32)  # [T, freq_count]
 
-                # ∣Q∣ mean (for norm‑based scoring)
-                abs_mean = float(
-                    mx.sqrt(mx.sum(q_head.astype(mx.float32) ** 2, axis=-1).mean() + 1e-8)
-                )
+                # Per-frequency complex mean: [freq_count]
+                q_mean_real = real.mean(axis=0)
+                q_mean_imag = imag.mean(axis=0)
+
+                # Per-frequency |q| mean: [freq_count]  (NOT a scalar!)
+                q_abs = mx.sqrt(real ** 2 + imag ** 2 + 1e-12)  # [T, freq_count]
+                q_abs_mean = q_abs.mean(axis=0)  # [freq_count]
 
                 stats[(layer_idx, head_idx)] = {
-                    "freq_real": np.array(freq_real.real, dtype=np.float32),
-                    "freq_imag": np.array(freq_imag.real, dtype=np.float32),
-                    "abs_mean": np.float32(abs_mean),
+                    "q_mean_real": np.array(q_mean_real, dtype=np.float32),
+                    "q_mean_imag": np.array(q_mean_imag, dtype=np.float32),
+                    "q_abs_mean": np.array(q_abs_mean, dtype=np.float32),
                 }
+
+            # Free memory
+            cs.q_rot_samples.clear()
+            cs.positions_samples.clear()
 
         return stats
 
@@ -109,11 +260,16 @@ _PATCHED_CLASS = None
 
 class AttentionCalibrationHook:
     """
-    Hooks Qwen3NextAttention to capture pre‑RoPE Q activations.
+    Hooks Qwen3NextAttention to capture POST-RoPE Q activations.
 
     Uses a class-level interceptor installed once, dispatching to
-    per‑instance hooks via _HOOK_TABLE[id(module)].  Safe to unhook
+    per-instance hooks via _HOOK_TABLE[id(module)].  Safe to unhook
     individually without affecting sibling hooks.
+
+    In the hook we replicate the model's Q path: q_proj → (optional) q_norm
+    → apply RoPE (half-split, partial-rotary aware) → capture q_rot.
+    ``compute_stats`` later inverts RoPE to recover rotation-removed stats,
+    matching the canonical CUDA pipeline and the MLX consumer.
     """
 
     def __init__(
@@ -155,23 +311,62 @@ class AttentionCalibrationHook:
             return
         _HOOK_TABLE.pop(self._module_id, None)
         self._hooked = False
+        # Restore original __call__ when no hooks remain.
+        if not _HOOK_TABLE and _PATCHED_CLASS is not None and _SAVED_CLASS_CALL is not None:
+            _PATCHED_CLASS.__call__ = _SAVED_CLASS_CALL
+            _PATCHED_CLASS = None
+            _SAVED_CLASS_CALL = None
 
 
 def _shared_attention_interceptor(self_attn, x: mx.array, mask=None, cache=None):
-    """Class‑level interceptor — dispatches by Python object id."""
+    """Class-level interceptor — dispatches by Python object id.
+
+    Captures POST-RoPE Q by replicating the model's Q path:
+      q_proj → split (gate) → reshape → q_norm (if present) → RoPE → capture.
+    """
     hook = _HOOK_TABLE.get(id(self_attn))
     if hook is not None:
+        acc = hook._accumulator
         bsz, q_len, _ = x.shape
         nheads = hook._num_heads
         hdim = hook._head_dim
+
         q_proj_output = self_attn.q_proj(x)
+        # Qwen3Next splits q_proj into queries + gate.
         queries, _gate = mx.split(
             q_proj_output.reshape(bsz, q_len, nheads, -1), 2, axis=-1
         )
-        q_flat = queries.reshape(-1, nheads, hdim)
-        offset = cache.offset if cache else 0
+        # queries: [bsz, q_len, nheads, hdim]
+
+        # Apply q_norm if the attention layer has one (Qwen3 RMSNorm per-head).
+        q_norm = getattr(self_attn, "q_norm", None)
+        if q_norm is not None:
+            try:
+                queries = q_norm(queries)
+            except Exception:
+                # q_norm may expect a different shape; try per-head flatten.
+                b, s, h, d = queries.shape
+                queries = q_norm(queries.reshape(b * h, s, d)).reshape(b, s, h, d)
+
+        # Build positions from cache offset (or zero).
+        offset = cache.offset if cache is not None else 0
         positions = mx.arange(offset, offset + q_len, dtype=mx.int32)
-        hook._accumulator.capture(hook._layer_idx, q_flat, positions)
+
+        # Reshape to [seq_len, nheads, head_dim] for RoPE (bsz=1 in calibration).
+        q_flat = queries.reshape(bsz, q_len, nheads, hdim)
+        if bsz != 1:
+            # Replicate positions for each batch row and flatten.
+            q_flat = q_flat.reshape(bsz * q_len, nheads, hdim)
+            positions = mx.broadcast_to(
+                positions[None, :], (bsz, q_len)
+            ).reshape(-1)
+        else:
+            q_flat = q_flat.reshape(q_len, nheads, hdim)
+
+        # Apply RoPE (half-split, partial-rotary aware) → capture POST-RoPE Q.
+        q_rot = _apply_rope(q_flat, positions, acc.inv_freq, acc.rotated_dim)
+        hook._accumulator.capture(hook._layer_idx, q_rot, positions)
+
     return _SAVED_CLASS_CALL(self_attn, x, mask=mask, cache=cache)
 
 
@@ -181,7 +376,7 @@ def _shared_attention_interceptor(self_attn, x: mx.array, mask=None, cache=None)
 
 def _find_attention_layers(model) -> List[Tuple[int, object, str]]:
     """
-    Discover full‑attention layers across supported architectures.
+    Discover full-attention layers across supported architectures.
 
     Returns: List[(layer_idx, module, architecture_tag)]
         architecture_tag ∈ {"qwen3next", "gemma"}
@@ -212,31 +407,34 @@ def _find_attention_layers(model) -> List[Tuple[int, object, str]]:
 
 
 def _detect_arch_config(model) -> dict:
-    """Extract architecture‑specific configuration."""
+    """Extract architecture-specific configuration."""
     cfg = {}
     try:
         args = model.args
-        tc = getattr(args, "text_config", {})
-        cfg["model_type"] = getattr(args, "model_type", "unknown")
-        cfg["head_dim"] = tc.get("head_dim", getattr(args, "head_dim", 128))
-        cfg["num_attention_heads"] = tc.get(
-            "num_attention_heads", getattr(args, "num_attention_heads", 8)
+        tc = getattr(args, "text_config", {}) or {}
+        get = lambda key, default: (
+            tc.get(key, getattr(args, key, default))
+            if isinstance(tc, dict)
+            else getattr(args, key, default)
         )
-        cfg["num_hidden_layers"] = tc.get(
-            "num_hidden_layers", getattr(args, "num_hidden_layers", 32)
+        cfg["model_type"] = str(get("model_type", "unknown"))
+        cfg["head_dim"] = int(get("head_dim", 128))
+        cfg["num_attention_heads"] = int(get("num_attention_heads", 8))
+        cfg["num_hidden_layers"] = int(get("num_hidden_layers", 32))
+        rope_params = get("rope_parameters", {}) or {}
+        cfg["rope_theta"] = float(
+            rope_params.get("rope_theta", get("rope_theta", 10000.0))
+            if isinstance(rope_params, dict)
+            else get("rope_theta", 10000.0)
         )
-        cfg["rope_theta"] = tc.get(
-            "rope_parameters", {}
-        ).get("rope_theta", getattr(args, "rope_theta", 10000.0))
-        cfg["partial_rotary_factor"] = tc.get(
-            "partial_rotary_factor",
-            getattr(args, "partial_rotary_factor", 1.0),
+        cfg["partial_rotary_factor"] = float(get("partial_rotary_factor", 1.0))
+        cfg["mrope_interleaved"] = bool(
+            rope_params.get("mrope_interleaved", False)
+            if isinstance(rope_params, dict)
+            else False
         )
-        cfg["mrope_interleaved"] = tc.get(
-            "rope_parameters", {}
-        ).get("mrope_interleaved", False)
-        if tc.get("rope_parameters", {}).get("mrope_section"):
-            cfg["mrope_section"] = tc["rope_parameters"]["mrope_section"]
+        if isinstance(rope_params, dict) and rope_params.get("mrope_section"):
+            cfg["mrope_section"] = rope_params["mrope_section"]
     except Exception as e:
         print(f"[Warning] Config detection incomplete: {e}")
     return cfg
@@ -260,7 +458,7 @@ CALIBRATION_PROMPTS: List[str] = [
     "Implement a thread-safe LRU cache in Python with O(1) operations.",
     "Explain the CAP theorem and its implications for real-world database choices.",
     "What is backpropagation? Derive the gradient update rules for a 2-layer neural network.",
-    "Compare and contrast B‑trees, LSM trees, and their use in modern databases.",
+    "Compare and contrast B-trees, LSM trees, and their use in modern databases.",
     "Write a SQL query to find the top 3 employees by salary in each department.",
     "Explain how HTTPS works: TLS handshake, certificate validation, session keys.",
     "What is a Bloom filter? Derive the false positive probability formula.",
@@ -277,7 +475,7 @@ CALIBRATION_PROMPTS: List[str] = [
     "What is the P vs NP problem? Explain using the traveling salesman example.",
     "Design a recommendation system for a streaming service with 50M users.",
     "Explain how garbage collection works in V8 (JavaScript engine).",
-    "What is a double‑spend attack on a blockchain? How is it prevented?",
+    "What is a double-spend attack on a blockchain? How is it prevented?",
     "Implement a minimal HTTP/1.1 server in Python that handles concurrent connections.",
 ]
 
@@ -315,24 +513,40 @@ def calibrate(
 
     # ── Detect architecture ──
     arch = _detect_arch_config(model)
+    head_dim = arch.get("head_dim", 256)
+    num_heads = arch.get("num_attention_heads", 24)
+    num_layers = arch.get("num_hidden_layers", 64)
+    rope_theta = arch.get("rope_theta", 10000.0)
+    partial_rotary_factor = arch.get("partial_rotary_factor", 1.0)
+
+    rotated_dim = _rotated_dim(head_dim, partial_rotary_factor)
+    freq_count = rotated_dim // 2
+
     print(f"[Calibrate] Model: {arch.get('model_type', 'unknown')}")
-    print(f"[Calibrate] Heads: {arch.get('num_attention_heads', '?')} × "
-          f"head_dim={arch.get('head_dim', '?')}")
-    print(f"[Calibrate] RoPE θ: {arch.get('rope_theta', '?')}")
-    print(f"[Calibrate] Partial rotary: {arch.get('partial_rotary_factor', '?')}")
-    print(f"[Calibrate] M‑RoPE: {arch.get('mrope_interleaved', False)}")
+    print(f"[Calibrate] Heads: {num_heads} × head_dim={head_dim}")
+    print(f"[Calibrate] RoPE θ: {rope_theta}")
+    print(f"[Calibrate] Partial rotary: {partial_rotary_factor} "
+          f"→ rotated_dim={rotated_dim}, freq_count={freq_count}")
+    print(f"[Calibrate] RoPE style: {ROPE_STYLE}")
+    print(f"[Calibrate] M-RoPE: {arch.get('mrope_interleaved', False)}")
 
     attn_layers = _find_attention_layers(model)
     if not attn_layers:
-        print("[Calibrate] ERROR: No full‑attention layers found. Aborting.")
+        print("[Calibrate] ERROR: No full-attention layers found. Aborting.")
         return False
 
-    print(f"[Calibrate] Found {len(attn_layers)} full‑attention layers: "
+    print(f"[Calibrate] Found {len(attn_layers)} full-attention layers: "
           f"{[l for l, _, _ in attn_layers]}")
     print(f"[Calibrate] Samples: {num_samples}")
 
     # ── Setup accumulator ──
-    accumulator = StatsAccumulator(num_layers=arch.get("num_hidden_layers", 64))
+    accumulator = StatsAccumulator(
+        num_layers=num_layers,
+        head_dim=head_dim,
+        rope_theta=rope_theta,
+        partial_rotary_factor=partial_rotary_factor,
+        rope_style=ROPE_STYLE,
+    )
 
     # ── Install hooks ──
     hooks: List[AttentionCalibrationHook] = []
@@ -342,8 +556,8 @@ def calibrate(
                 module,
                 layer_idx=layer_idx,
                 accumulator=accumulator,
-                head_dim=arch.get("head_dim", 256),
-                num_heads=arch.get("num_attention_heads", 24),
+                head_dim=head_dim,
+                num_heads=num_heads,
             )
             hook.hook()
             hooks.append(hook)
@@ -400,30 +614,36 @@ def calibrate(
         return False
 
     n_entries = len(stats)
-    print(f"[Calibrate] Computed stats for {n_entries} head‑layer pairs.")
+    print(f"[Calibrate] Computed stats for {n_entries} head-layer pairs.")
 
-    # Convert to numpy‑friendly format
+    # ── Build npz payload ──
+    # Metadata (global)
     np_stats: dict = {
-        "model_type": np.array([arch.get("model_type", "unknown")]),
+        "model_type": np.array(arch.get("model_type", "unknown")),
         "calibrated": np.array([True], dtype=np.bool_),
-        "num_attention_heads": np.array([arch.get("num_attention_heads", 0)], dtype=np.int32),
-        "head_dim": np.array([arch.get("head_dim", 0)], dtype=np.int32),
-        "rope_theta": np.array([arch.get("rope_theta", 0.0)], dtype=np.float32),
-        "partial_rotary_factor": np.array(
-            [arch.get("partial_rotary_factor", 1.0)], dtype=np.float32
-        ),
+        "num_attention_heads": np.array([num_heads], dtype=np.int32),
+        "head_dim": np.array([head_dim], dtype=np.int32),
+        "rope_theta": np.array([rope_theta], dtype=np.float32),
+        "partial_rotary_factor": np.array([partial_rotary_factor], dtype=np.float32),
+        "rotated_dim": np.array([rotated_dim], dtype=np.int32),
+        "freq_count": np.array([freq_count], dtype=np.int32),
+        "rope_style": np.array(ROPE_STYLE),
         "num_samples": np.array([sample_count], dtype=np.int32),
     }
 
+    # Per-head stats — each array is [freq_count], NOT scalar.
     for (layer_idx, head_idx), head_stats in stats.items():
         prefix = f"l_{layer_idx}_h_{head_idx}"
-        np_stats[f"{prefix}_q_mean_real"] = head_stats["freq_real"]
-        np_stats[f"{prefix}_q_mean_imag"] = head_stats["freq_imag"]
-        np_stats[f"{prefix}_q_abs_mean"] = head_stats["abs_mean"]
+        np_stats[f"{prefix}_q_mean_real"] = head_stats["q_mean_real"]
+        np_stats[f"{prefix}_q_mean_imag"] = head_stats["q_mean_imag"]
+        np_stats[f"{prefix}_q_abs_mean"] = head_stats["q_abs_mean"]
 
     np.savez_compressed(str(output), **np_stats)
     size_mb = output.stat().st_size / (1024 * 1024)
     print(f"[Calibrate] Saved {n_entries} entries → {output} ({size_mb:.1f} MB)")
+    print(f"[Calibrate]   freq_count={freq_count}, "
+          f"partial_rotary_factor={partial_rotary_factor}, "
+          f"rope_style={ROPE_STYLE}")
     return True
 
 
