@@ -301,6 +301,8 @@ We thank the following projects for their contributions and inspiration:
 
 [@dscain](https://github.com/dscain) — DGX Spark (GB10) enablement for vLLM and non-vLLM paths
 
+[@yjl-001](https://github.com/yjl-001) — tolerate `no_compactable_groups` skips in strict compaction mode ([#16](https://github.com/WeianMao/triattention/pull/16))
+
 ## License
 
 This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
