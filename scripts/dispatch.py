@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -316,16 +317,12 @@ def questions_for_shard(total_questions: int, num_shards: int, shard_id: int) ->
 
 
 def auto_detect_gpus(threshold: int) -> List[str]:
-    cmd = [
-        "nvidia-smi",
-        "--query-gpu=index,memory.used,name",
-        "--format=csv,noheader,nounits",
-    ]
-    smi_text = subprocess.check_output(["nvidia-smi"], text=True)
-    if "NVIDIA GB10" in smi_text:
-        print("GB10/sm-121 found")
-        return ["0"] if threshold >= 0 else []
+    cmd = ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"]
     try:
+        smi_text = subprocess.check_output(["nvidia-smi"], text=True)
+        if "NVIDIA GB10" in smi_text:
+            print("GB10/sm-121 found")
+            return ["0"]
         output = subprocess.check_output(cmd, text=True)
     except (FileNotFoundError, subprocess.CalledProcessError):
         return []
@@ -333,7 +330,7 @@ def auto_detect_gpus(threshold: int) -> List[str]:
     detected: List[str] = []
     for line in output.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 3:
+        if len(parts) < 2:
             continue
         if not parts[0].isdigit() or not parts[1].isdigit():
             continue
@@ -400,7 +397,9 @@ def format_runner_args(args_dict: Dict[str, object], total_shards: int) -> List[
 
 
 def build_base_command(conda_env: str, runner_path: Path, runner_args: List[str]) -> List[str]:
-    return ["conda", "run", "-n", conda_env, "python", str(runner_path)] + runner_args
+    if conda_env and shutil.which("conda"):
+        return ["conda", "run", "-n", conda_env, "python", str(runner_path)] + runner_args
+    return [sys.executable, str(runner_path)] + runner_args
 
 
 def prepare_environment(env_overrides: Dict[str, str]) -> Dict[str, str]:
@@ -647,13 +646,11 @@ def run_evaluation(base_dir: Path, dataset: str, exp_name: str, output_dir: Opti
     if not any(base_dir.glob("*.jsonl")):
         print(f"[eval] skip, no jsonl under {base_dir}")
         return
-    cmd = [
-        "conda",
-        "run",
-        "-n",
-        conda_env,
-        "python",
-        str(MULTI_EVAL_SCRIPT),
+    if conda_env and shutil.which("conda"):
+        cmd = ["conda", "run", "-n", conda_env, "python", str(MULTI_EVAL_SCRIPT)]
+    else:
+        cmd = [sys.executable, str(MULTI_EVAL_SCRIPT)]
+    cmd += [
         "--base_dir",
         str(base_dir),
         "--dataset",
