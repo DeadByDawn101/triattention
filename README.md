@@ -4,6 +4,7 @@
 
 [![Paper](https://img.shields.io/badge/ArXiv-Paper-brown)](https://arxiv.org/abs/2604.04921)
 [![Project Page](https://img.shields.io/badge/Project-Page-teal)](https://weianmao.github.io/tri-attention-project-page/)
+[![Poster](https://img.shields.io/badge/Poster-View-A31F34)](docs/assets/poster.png)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/downloads/)
 
