@@ -177,7 +177,11 @@ def _convert_rkv_stats(
 
     # Handle GQA: if num_kv_heads specified and < num_attention_heads
     if num_kv_heads is None:
-        num_kv_heads = num_attention_heads
+        meta_kv_heads = rkv_metadata.get(
+            "num_kv_heads",
+            rkv_metadata.get("num_key_value_heads"),
+        )
+        num_kv_heads = int(meta_kv_heads) if meta_kv_heads else num_attention_heads
 
     gqa_ratio = num_attention_heads // num_kv_heads if num_kv_heads > 0 else 1
 
@@ -281,7 +285,13 @@ def _convert_rkv_stats(
                     dtype=dtype,
                     device=device,
                 ).to(device=device, dtype=dtype)
-                freq_scale_sq = freq_scale.pow(2)
+                freq_scale_sq = freq_scale.flatten().pow(2)
+                if freq_scale_sq.numel() < freq_count:
+                    padded = torch.ones(freq_count, device=device, dtype=dtype)
+                    padded[: freq_scale_sq.numel()] = freq_scale_sq
+                    freq_scale_sq = padded
+                else:
+                    freq_scale_sq = freq_scale_sq[:freq_count].contiguous()
                 return freq_scale_sq.unsqueeze(0).expand(num_kv_heads, -1).contiguous()
             except Exception:
                 pass

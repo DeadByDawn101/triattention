@@ -236,11 +236,17 @@ def load_stats(
                 dtype=dtype,
                 device=device,
             ).to(device=device, dtype=torch.float32)
-            freq_scale_sq = freq_scale.pow(2)  # [freq_count]
+            freq_scale_sq = freq_scale.flatten().pow(2)  # [freq_count]
         except Exception:
             pass
     if freq_scale_sq is None:
         freq_scale_sq = torch.ones(freq_count, device=device, dtype=torch.float32)
+    elif freq_scale_sq.numel() < freq_count:
+        padded = torch.ones(freq_count, device=device, dtype=torch.float32)
+        padded[: freq_scale_sq.numel()] = freq_scale_sq
+        freq_scale_sq = padded
+    else:
+        freq_scale_sq = freq_scale_sq[:freq_count].contiguous()
 
     # --- build per-layer stats at attention-head granularity ---
     # Each layer stores tensors with dim-0 = num_attention_heads
