@@ -1,6 +1,6 @@
 """
 TriAttention MLX — Native Apple Silicon Port
-=============================================
+============================================
 Ports the core TriAttention trigonometric KV compression algorithm to MLX.
 
 Key insight from the paper:
@@ -14,6 +14,14 @@ This MLX port integrates with mlx-lm's KV cache system:
   - Compresses KV cache when it exceeds kv_budget
   - Uses pre-RoPE frequency statistics for scoring
   - Works with Apple Silicon unified memory (M1/M2/M3/M4 Max)
+
+RoPE conventions (matching the canonical CUDA pipeline in scripts/calibrate.py):
+  - Half-split (NeoX) layout: k1, k2 = k[..., :half], k[..., half:]
+  - partial_rotary_factor: only the first ``rotated_dim = int(partial_rotary_factor *
+    head_dim)`` dimensions are rotated by RoPE.  The remaining dimensions pass
+    through unchanged and are excluded from frequency statistics.
+  - freq_count = rotated_dim // 2.  All per-frequency stats (q_mean_real,
+    q_mean_imag, q_abs_mean) are vectors of shape [freq_count].
 
 References:
   Paper:  https://arxiv.org/abs/2604.04921
@@ -40,60 +48,87 @@ import numpy as np
 @dataclass
 class TriAttentionMLXConfig:
     """Configuration for TriAttention MLX compression."""
-    
+
     stats_path: Optional[Path] = None
-    """Path to precomputed frequency statistics (.npz). 
+    """Path to precomputed frequency statistics (.npz).
     If None, runs without stats (uses norm-only scoring — less accurate)."""
-    
+
     kv_budget: int = 2048
     """Maximum number of KV pairs to keep per layer."""
-    
+
     divide_length: int = 128
     """Compress every N decode steps."""
-    
+
     score_aggregation: str = "mean"
     """How to aggregate scores across heads: 'mean' or 'max'."""
-    
+
     prefill_pin: bool = True
     """Always preserve prefill (prompt) tokens — never evict them."""
-    
+
     disable_trig: bool = False
     """If True, use norm-only scoring (no trigonometric term). Faster but less accurate."""
-    
+
     disable_mlr: bool = False
     """If True, skip the mean-log-ratio extra term."""
-    
+
     head_dim: int = 256
     """Attention head dimension (model-specific)."""
-    
+
     rope_theta: float = 10000.0
     """RoPE base frequency."""
+
+    partial_rotary_factor: float = 1.0
+    """Fraction of head_dim that is rotated by RoPE.
+    For Qwen3.5/6: 0.25 → only the first 64 of 256 dims are rotated,
+    giving freq_count = 32 frequencies."""
 
 
 # ─────────────────────────── Frequency Stats ─────────────────────────────────
 
 @dataclass
 class HeadFrequencyStats:
-    """Pre-RoPE frequency statistics for one attention head."""
-    q_mean_real: mx.array     # [head_dim/2] — real part of Q center
-    q_mean_imag: mx.array     # [head_dim/2] — imag part of Q center  
-    q_abs_mean: mx.array      # [head_dim/2] — |Q| mean for norm term
+    """Pre-RoPE frequency statistics for one attention head.
+
+    All arrays have shape [freq_count] where
+    ``freq_count = int(partial_rotary_factor * head_dim) // 2``.
+    """
+    q_mean_real: mx.array     # [freq_count] — real part of Q center
+    q_mean_imag: mx.array     # [freq_count] — imag part of Q center
+    q_abs_mean: mx.array      # [freq_count] — |Q| mean for norm term
     layer_idx: int
     head_idx: int
 
 
-def load_stats(stats_path: Path) -> Dict[Tuple[int, int], HeadFrequencyStats]:
-    """Load precomputed frequency statistics from .npz file."""
+@dataclass
+class StatsMetadata:
+    """Metadata loaded alongside frequency statistics."""
+    partial_rotary_factor: float = 1.0
+    rope_theta: float = 10000.0
+    head_dim: int = 256
+    rope_style: str = "half"
+    model_type: str = "unknown"
+
+
+def load_stats(
+    stats_path: Path,
+) -> Tuple[Dict[Tuple[int, int], HeadFrequencyStats], StatsMetadata]:
+    """Load precomputed frequency statistics from .npz file.
+
+    Returns:
+        (stats_dict, metadata) where stats_dict maps (layer_idx, head_idx) →
+        HeadFrequencyStats and metadata carries global config such as
+        partial_rotary_factor.
+    """
     data = np.load(str(stats_path))
-    stats = {}
-    
-    # Expected format: {layer}_{head}_q_mean_real, {layer}_{head}_q_mean_imag, {layer}_{head}_q_abs_mean
+    stats: Dict[Tuple[int, int], HeadFrequencyStats] = {}
+
+    # Expected format: l_{layer}_h_{head}_q_mean_real, ..._q_mean_imag, ..._q_abs_mean
     keys = set()
     for k in data.files:
         parts = k.split("_")
         if len(parts) >= 4 and parts[0] == "l" and parts[2] == "h":
             keys.add((int(parts[1]), int(parts[3])))
-    
+
     for layer_idx, head_idx in keys:
         prefix = f"l_{layer_idx}_h_{head_idx}"
         stats[(layer_idx, head_idx)] = HeadFrequencyStats(
@@ -103,43 +138,101 @@ def load_stats(stats_path: Path) -> Dict[Tuple[int, int], HeadFrequencyStats]:
             layer_idx=layer_idx,
             head_idx=head_idx,
         )
-    
-    return stats
+
+    # Read metadata (with safe defaults)
+    def _get_float(name: str, default: float) -> float:
+        if name in data.files:
+            return float(np.asarray(data[name]).item())
+        return default
+
+    def _get_str(name: str, default: str) -> str:
+        if name in data.files:
+            val = np.asarray(data[name])
+            return str(val.item()) if val.ndim == 0 else str(val)
+        return default
+
+    metadata = StatsMetadata(
+        partial_rotary_factor=_get_float("partial_rotary_factor", 1.0),
+        rope_theta=_get_float("rope_theta", 10000.0),
+        head_dim=int(_get_float("head_dim", 256)),
+        rope_style=_get_str("rope_style", "half"),
+        model_type=_get_str("model_type", "unknown"),
+    )
+
+    return stats, metadata
 
 
 # ─────────────────────────── Scoring Engine ──────────────────────────────────
 
-def build_inv_freq(head_dim: int, rope_theta: float) -> mx.array:
-    """Build inverse frequencies for RoPE."""
-    i = mx.arange(0, head_dim // 2, dtype=mx.float32)
-    return 1.0 / (rope_theta ** (2 * i / head_dim))
+def build_inv_freq(
+    head_dim: int,
+    rope_theta: float,
+    partial_rotary_factor: float = 1.0,
+) -> mx.array:
+    """Build inverse frequencies for RoPE.
+
+    Only ``rotated_dim = int(partial_rotary_factor * head_dim)`` dimensions are
+    rotated, giving ``freq_count = rotated_dim // 2`` frequencies.
+
+    Returns: inv_freq [freq_count]
+    """
+    rotated_dim = max(2, int(partial_rotary_factor * head_dim))
+    freq_count = rotated_dim // 2
+    i = mx.arange(0, freq_count, dtype=mx.float32)
+    return 1.0 / (rope_theta ** (2 * i / rotated_dim))
 
 
-def invert_rope_mlx(k: mx.array, positions: mx.array, inv_freq: mx.array) -> mx.array:
+def _rotated_dim(head_dim: int, partial_rotary_factor: float) -> int:
+    """Number of leading dimensions rotated by RoPE."""
+    return max(2, int(partial_rotary_factor * head_dim))
+
+
+def invert_rope_mlx(
+    k: mx.array,
+    positions: mx.array,
+    inv_freq: mx.array,
+    rotated_dim: Optional[int] = None,
+) -> mx.array:
     """
     Remove RoPE rotation from key vectors to get pre-RoPE representation.
-    
-    k: [seq_len, head_dim]
+
+    Uses half-split (NeoX) convention matching the canonical CUDA pipeline.
+    Only the first ``rotated_dim`` dimensions are un-rotated; the rest pass
+    through unchanged (partial rotary support).
+
+    k: [seq_len, head_dim] (post-RoPE)
     positions: [seq_len]
-    inv_freq: [head_dim/2]
-    
+    inv_freq: [freq_count] where freq_count = rotated_dim // 2
+    rotated_dim: number of leading dims that were rotated. If None, inferred
+                 from inv_freq.shape[0] * 2.
+
     Returns: k_pre_rope [seq_len, head_dim]
     """
-    # Build rotation angles: [seq_len, head_dim/2]
-    theta = mx.outer(positions.astype(mx.float32), inv_freq)  # [seq_len, head_dim/2]
-    
-    cos_t = mx.cos(theta)  # [seq_len, head_dim/2]
-    sin_t = mx.sin(theta)  # [seq_len, head_dim/2]
-    
-    # Split k into two halves (standard RoPE layout)
+    head_dim = k.shape[-1]
+    if rotated_dim is None:
+        rotated_dim = int(inv_freq.shape[0]) * 2
+    else:
+        rotated_dim = int(rotated_dim)
+    freq_count = rotated_dim // 2
+
+    # Build rotation angles: [seq_len, freq_count]
+    theta = mx.outer(positions.astype(mx.float32), inv_freq.astype(mx.float32))
+    cos_t = mx.cos(theta)  # [seq_len, freq_count]
+    sin_t = mx.sin(theta)
+
     k = k.astype(mx.float32)
-    k1, k2 = k[..., :k.shape[-1]//2], k[..., k.shape[-1]//2:]
-    
-    # Inverse rotation: multiply by transpose of rotation matrix
-    # R^-1 = R^T: [cos, sin; -sin, cos]^T = [cos, -sin; sin, cos]
+    # Half-split: first half = real, second half = imag
+    k1 = k[..., :freq_count]            # [seq_len, freq_count]
+    k2 = k[..., freq_count:rotated_dim]  # [seq_len, freq_count]
+
+    # Inverse rotation: R^-1 = R^T → [cos, sin; -sin, cos]
     k1_orig = k1 * cos_t + k2 * sin_t
     k2_orig = -k1 * sin_t + k2 * cos_t
-    
+
+    if rotated_dim < head_dim:
+        # Pass through non-rotated tail unchanged
+        k_rest = k[..., rotated_dim:]
+        return mx.concatenate([k1_orig, k2_orig, k_rest], axis=-1)
     return mx.concatenate([k1_orig, k2_orig], axis=-1)
 
 
@@ -154,63 +247,61 @@ def score_keys_trig(
 ) -> mx.array:
     """
     Score keys using trigonometric frequency analysis.
-    
+
     Core TriAttention algorithm:
       score(key_i) = Σ_f amp_f * cos(omega_f * (pos_i - current_pos) + phi_f)
                    + alpha * ||k_pre_i||
-    
-    k_pre: [seq_len, head_dim] — pre-RoPE keys
+
+    k_pre: [seq_len, head_dim] — pre-RoPE keys (rotation-removed)
     positions: [seq_len] — absolute positions of each key
-    stats: frequency statistics for this head
-    inv_freq: [head_dim/2]
+    stats: frequency statistics for this head (q_abs_mean is [freq_count])
+    inv_freq: [freq_count]
     absolute_position: current decode position
-    
+
     Returns: scores [seq_len]
     """
     seq_len = k_pre.shape[0]
-    
-    # Norm term: ||k_pre|| (always active unless both disabled)
+    freq_count = inv_freq.shape[0]
+
+    # Norm term: ||k_pre|| (always active unless trig disabled)
     k_norms = mx.sqrt(mx.sum(k_pre ** 2, axis=-1) + 1e-8)  # [seq_len]
-    
+
     if disable_trig:
         return k_norms
-    
-    # Build trigonometric score
-    # Amplitude and phase from Q center statistics
-    q_complex_real = stats.q_mean_real  # [head_dim/2]
-    q_complex_imag = stats.q_mean_imag  # [head_dim/2]
-    
-    # amp = |Q_center| per frequency
-    amp = mx.sqrt(q_complex_real ** 2 + q_complex_imag ** 2 + 1e-8)  # [head_dim/2]
-    
-    # phi = angle of Q_center per frequency
-    phi = mx.arctan2(q_complex_imag, q_complex_real)  # [head_dim/2]
-    
+
+    # Amplitude and phase from Q center statistics (per-frequency)
+    q_complex_real = stats.q_mean_real  # [freq_count]
+    q_complex_imag = stats.q_mean_imag  # [freq_count]
+
+    amp = mx.sqrt(q_complex_real ** 2 + q_complex_imag ** 2 + 1e-8)  # [freq_count]
+    phi = mx.arctan2(q_complex_imag, q_complex_real)  # [freq_count]
+
     # Distance offsets: current_pos - key_pos
     offsets = float(absolute_position) - positions.astype(mx.float32)  # [seq_len]
-    
-    # Phase at each key position: omega * offset + phi
-    # [seq_len, head_dim/2] = outer product
-    phase = mx.outer(offsets, inv_freq) + phi[None, :]  # [seq_len, head_dim/2]
-    
-    # Weighted cosine sum: amp * cos(phase)
-    trig_scores = mx.sum(amp[None, :] * mx.cos(phase), axis=-1)  # [seq_len]
-    
+
+    # Phase at each key position: omega * offset + phi → [seq_len, freq_count]
+    phase = mx.outer(offsets, inv_freq) + phi[None, :]
+
     # Frequency scaling: weight higher-frequency components less
     freq_scale = inv_freq / (inv_freq.max() + 1e-8)
     freq_scale_sq = freq_scale ** 2
-    trig_scores_scaled = mx.sum(amp[None, :] * freq_scale_sq[None, :] * mx.cos(phase), axis=-1)
-    
-    # MLR extra term: correlation between k_pre norm and Q abs mean
+    trig_scores_scaled = mx.sum(
+        amp[None, :] * freq_scale_sq[None, :] * mx.cos(phase), axis=-1
+    )  # [seq_len]
+
+    # MLR extra term: correlation between k_pre abs and Q abs mean.
+    # Uses half-split pairing on the rotated dims only, producing [freq_count].
     if not disable_mlr:
-        q_abs = stats.q_abs_mean  # [head_dim/2]
-        k_abs = mx.abs(k_pre[..., :k_pre.shape[-1]//2]) + mx.abs(k_pre[..., k_pre.shape[-1]//2:])
-        k_abs = k_abs.reshape(seq_len, -1, 2).mean(axis=-1)  # [seq_len, head_dim/2]
-        # Clip to avoid log(0)
+        q_abs = stats.q_abs_mean  # [freq_count]
+        k_rotated = k_pre[..., : 2 * freq_count]  # [seq_len, rotated_dim]
+        k_abs = (
+            mx.abs(k_rotated[..., :freq_count])
+            + mx.abs(k_rotated[..., freq_count: 2 * freq_count])
+        ) / 2.0  # [seq_len, freq_count]
         ratio = mx.clip(k_abs / (q_abs[None, :] + 1e-8), 1e-6, 1e6)
         mlr = mx.sum(q_abs[None, :] * mx.log(ratio + 1e-8), axis=-1)  # [seq_len]
         return trig_scores_scaled + 0.1 * mlr + 0.01 * k_norms
-    
+
     return trig_scores_scaled + 0.01 * k_norms
 
 
@@ -219,35 +310,48 @@ def score_keys_trig(
 class TriAttentionMLX:
     """
     TriAttention KV cache compressor for MLX models.
-    
+
     Integrates with mlx-lm's KV cache by hooking into the model's decode loop.
     """
-    
+
     def __init__(self, config: TriAttentionMLXConfig):
         self.config = config
-        self.inv_freq = build_inv_freq(config.head_dim, config.rope_theta)
-        
+        self.rotated_dim = _rotated_dim(config.head_dim, config.partial_rotary_factor)
+        self.inv_freq = build_inv_freq(
+            config.head_dim, config.rope_theta, config.partial_rotary_factor
+        )
+
         # Load stats if provided
         self.stats: Dict[Tuple[int, int], HeadFrequencyStats] = {}
         if config.stats_path and Path(config.stats_path).exists():
-            self.stats = load_stats(Path(config.stats_path))
-            print(f"[TriAttention MLX] Loaded stats for {len(self.stats)} heads")
+            self.stats, meta = load_stats(Path(config.stats_path))
+            # Adopt partial_rotary_factor / rope_theta from stats metadata if
+            # the caller did not override them from the defaults.
+            if config.partial_rotary_factor == 1.0 and meta.partial_rotary_factor != 1.0:
+                config.partial_rotary_factor = meta.partial_rotary_factor
+                self.rotated_dim = _rotated_dim(config.head_dim, config.partial_rotary_factor)
+                self.inv_freq = build_inv_freq(
+                    config.head_dim, config.rope_theta, config.partial_rotary_factor
+                )
+            print(f"[TriAttention MLX] Loaded stats for {len(self.stats)} heads "
+                  f"(partial_rotary_factor={config.partial_rotary_factor}, "
+                  f"freq_count={self.inv_freq.shape[0]})")
         else:
             print("[TriAttention MLX] No stats file — using norm-only scoring")
-        
+
         # State
         self.cache_positions: List[int] = []
         self.absolute_position: int = 0
         self.prefix_length: int = 0
         self.step_count: int = 0
-    
+
     def reset(self):
         """Reset for new generation."""
         self.cache_positions = []
         self.absolute_position = 0
         self.prefix_length = 0
         self.step_count = 0
-    
+
     def should_compress(self, cache_len: int) -> bool:
         """Check if we should compress now."""
         effective = cache_len
@@ -258,7 +362,7 @@ class TriAttentionMLX:
             and self.step_count > 0
             and (self.step_count % self.config.divide_length == 0)
         )
-    
+
     def score_layer(
         self,
         keys: mx.array,
@@ -267,22 +371,24 @@ class TriAttentionMLX:
     ) -> mx.array:
         """
         Score all keys in one layer.
-        
-        keys: [num_heads, seq_len, head_dim] (pre-RoPE or post-RoPE)
+
+        keys: [num_heads, seq_len, head_dim] (post-RoPE, as stored in cache)
         positions: [seq_len]
-        
+
         Returns: scores [seq_len]
         """
         num_heads = keys.shape[0]
         all_scores = []
-        
+
         for head_idx in range(num_heads):
             k_head = keys[head_idx]  # [seq_len, head_dim]
-            
+
             if (layer_idx, head_idx) in self.stats:
                 stats = self.stats[(layer_idx, head_idx)]
                 # Invert RoPE first (keys in cache are post-RoPE)
-                k_pre = invert_rope_mlx(k_head, positions, self.inv_freq)
+                k_pre = invert_rope_mlx(
+                    k_head, positions, self.inv_freq, self.rotated_dim
+                )
                 scores = score_keys_trig(
                     k_pre, positions, stats, self.inv_freq,
                     self.absolute_position,
@@ -292,33 +398,33 @@ class TriAttentionMLX:
             else:
                 # Fallback: norm-only scoring
                 scores = mx.sqrt(mx.sum(k_head.astype(mx.float32) ** 2, axis=-1) + 1e-8)
-            
+
             all_scores.append(scores)
-        
+
         # Aggregate across heads
         stacked = mx.stack(all_scores, axis=0)  # [num_heads, seq_len]
         if self.config.score_aggregation == "max":
             return stacked.max(axis=0)
         return stacked.mean(axis=0)
-    
+
     def compress_cache(
         self,
         kv_cache: List[Tuple[mx.array, mx.array]],
     ) -> List[Tuple[mx.array, mx.array]]:
         """
         Compress KV cache by evicting low-importance tokens.
-        
+
         kv_cache: list of (keys, values) per layer
                   keys: [batch, num_heads, seq_len, head_dim]
-        
+
         Returns: compressed kv_cache
         """
         if not kv_cache:
             return kv_cache
-        
+
         seq_len = kv_cache[0][0].shape[2]
         positions = mx.array(self.cache_positions[:seq_len], dtype=mx.int32)
-        
+
         # Compute scores across all layers
         all_scores = []
         for layer_idx, (keys, _) in enumerate(kv_cache):
@@ -326,33 +432,33 @@ class TriAttentionMLX:
             layer_keys = keys[0]  # [num_heads, seq_len, head_dim]
             layer_scores = self.score_layer(layer_keys, positions, layer_idx)
             all_scores.append(layer_scores)
-        
+
         # Aggregate across layers
         score_matrix = mx.stack(all_scores, axis=0)  # [num_layers, seq_len]
         global_scores = score_matrix.mean(axis=0)  # [seq_len]
-        
+
         # Always keep prefill tokens
         prefix = self.prefix_length if self.config.prefill_pin else 0
         decode_scores = global_scores[prefix:]
         decode_len = decode_scores.shape[0]
-        
+
         decode_budget = max(0, self.config.kv_budget - prefix)
-        
+
         if decode_len <= decode_budget:
             return kv_cache  # Nothing to compress
-        
+
         # Top-k selection on decode tokens
         keep_k = min(decode_budget, decode_len)
         top_indices = mx.argsort(-decode_scores)[:keep_k]  # descending
         top_indices_sorted = mx.sort(top_indices)
-        
+
         # Add back prefill offset
         decode_keep_abs = top_indices_sorted + prefix
-        
+
         # Combine: all prefill + selected decode
         prefill_indices = mx.arange(prefix)
         keep_indices = mx.concatenate([prefill_indices, decode_keep_abs])
-        
+
         # Apply compression to each layer
         new_cache = []
         for keys, values in kv_cache:
@@ -360,11 +466,11 @@ class TriAttentionMLX:
             k_new = keys[:, :, keep_indices, :]
             v_new = values[:, :, keep_indices, :]
             new_cache.append((k_new, v_new))
-        
+
         # Update position tracking
         keep_list = keep_indices.tolist()
         self.cache_positions = [self.cache_positions[i] for i in keep_list]
-        
+
         return new_cache
 
 
@@ -380,10 +486,11 @@ def apply_triattention_mlx(
     disable_trig: bool = False,
     disable_mlr: bool = False,
     rope_theta: float = 10000.0,
+    partial_rotary_factor: float = 1.0,
 ) -> TriAttentionMLX:
     """
     Apply TriAttention KV compression to an mlx-lm model.
-    
+
     Usage:
         model, tokenizer = mlx_lm.load("deadbydawn101/gemma-4-E4B-Agentic-Opus-Reasoning-GeminiCLI-mlx-4bit")
         compressor = apply_triattention_mlx(
@@ -391,9 +498,9 @@ def apply_triattention_mlx(
             stats_path="triattention/calibration/gemma4_e4b_stats.npz",
             kv_budget=2048,
         )
-        
+
         # Then in your generation loop, call compressor.step(kv_cache) after each decode step
-    
+
     Args:
         model: mlx-lm model instance
         stats_path: Path to precomputed .npz stats (optional but recommended)
@@ -404,21 +511,33 @@ def apply_triattention_mlx(
         disable_trig: Use norm-only scoring (faster, less accurate)
         disable_mlr: Skip mean-log-ratio term
         rope_theta: RoPE base frequency (match your model)
-    
+        partial_rotary_factor: Fraction of head_dim rotated by RoPE
+                               (Qwen3.5/6: 0.25).  Auto-detected from stats
+                               metadata if available.
+
     Returns:
         TriAttentionMLX compressor instance
     """
-    # Detect head_dim from model
+    # Detect head_dim and rotary config from model
     head_dim = 256  # default for Gemma 4
     try:
         if hasattr(model, "args"):
-            head_dim = getattr(model.args, "head_dim", 
-                      getattr(model.args, "hidden_size", 2048) // 
-                      getattr(model.args, "num_attention_heads", 8))
-            rope_theta = float(getattr(model.args, "rope_theta", rope_theta))
+            args = model.args
+            tc = getattr(args, "text_config", {}) or {}
+            get = lambda key, default: (
+                tc.get(key, getattr(args, key, default))
+                if isinstance(tc, dict)
+                else getattr(args, key, default)
+            )
+            head_dim = int(get("head_dim",
+                getattr(args, "hidden_size", 2048) // getattr(args, "num_attention_heads", 8)))
+            rope_theta = float(get("rope_theta", rope_theta))
+            partial_rotary_factor = float(
+                get("partial_rotary_factor", partial_rotary_factor)
+            )
     except Exception:
         pass
-    
+
     config = TriAttentionMLXConfig(
         stats_path=Path(stats_path) if stats_path else None,
         kv_budget=kv_budget,
@@ -429,19 +548,22 @@ def apply_triattention_mlx(
         disable_mlr=disable_mlr,
         head_dim=head_dim,
         rope_theta=rope_theta,
+        partial_rotary_factor=partial_rotary_factor,
     )
-    
+
     compressor = TriAttentionMLX(config)
-    
+
     # Attach to model for easy access
     model._triattention_mlx = compressor
-    
+
     print(
         f"[TriAttention MLX] Applied — budget={kv_budget}, "
         f"divide_length={divide_length}, head_dim={head_dim}, "
+        f"partial_rotary={config.partial_rotary_factor}, "
+        f"freq_count={compressor.inv_freq.shape[0]}, "
         f"stats={'loaded' if compressor.stats else 'none (norm-only)'}"
     )
-    
+
     return compressor
 
 
@@ -455,13 +577,13 @@ def triattention_generate_step(
 ) -> List[Tuple[mx.array, mx.array]]:
     """
     Call this after each decode step to manage KV compression.
-    
+
     Args:
         compressor: TriAttentionMLX instance
         kv_cache: Current KV cache from model
         is_prefill: True for first (prompt) forward pass
         current_position: Current absolute position in sequence
-    
+
     Returns:
         (possibly compressed) KV cache
     """
@@ -472,15 +594,15 @@ def triattention_generate_step(
         compressor.absolute_position = seq_len
         compressor.prefix_length = seq_len
         return kv_cache
-    
+
     # Track new position
     compressor.cache_positions.append(current_position)
     compressor.absolute_position = current_position + 1
     compressor.step_count += 1
-    
+
     # Compress if needed
     cache_len = kv_cache[0][0].shape[2] if kv_cache else 0
     if compressor.should_compress(cache_len):
         kv_cache = compressor.compress_cache(kv_cache)
-    
+
     return kv_cache
