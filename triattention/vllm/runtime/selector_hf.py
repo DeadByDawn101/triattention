@@ -155,7 +155,7 @@ def build_triattention_selector(
             return cached
 
         layer_stats = compressor.head_stats[resolved_layer_idx]
-        layer_freq_scale_sq = compressor.freq_scale_sq[resolved_layer_idx]
+        layer_freq_scale_sq = compressor.get_layer_freq_scale_sq(resolved_layer_idx)
         source_heads = int(layer_freq_scale_sq.shape[0])
         if source_heads == target_heads:
             reduced = (layer_stats, layer_freq_scale_sq)
@@ -214,6 +214,7 @@ def build_triattention_selector(
         (
             score_head_stats,
             score_freq_scale_sq,
+            score_omega,
             use_hf_group_max,
             group_size,
         ) = _resolve_layer_score_inputs(
@@ -225,6 +226,7 @@ def build_triattention_selector(
             keys_dense=keys_dense,
             score_head_stats=score_head_stats,
             score_freq_scale_sq=score_freq_scale_sq,
+            score_omega=score_omega,
             use_hf_group_max=use_hf_group_max,
             group_size=group_size,
             round_start=round_start,
@@ -243,10 +245,11 @@ def build_triattention_selector(
         *,
         layer_idx: int,
         runtime_heads: int,
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, bool, int]:
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, bool, int]:
         resolved_layer_idx = _resolve_layer_idx_for_stats(layer_idx)
         layer_head_stats = compressor.head_stats[resolved_layer_idx]
-        layer_freq_scale_sq = compressor.freq_scale_sq[resolved_layer_idx]
+        layer_freq_scale_sq = compressor.get_layer_freq_scale_sq(resolved_layer_idx)
+        layer_omega = compressor.get_layer_omega(resolved_layer_idx)
         stats_heads = int(layer_freq_scale_sq.shape[0])
         use_hf_group_max = (
             stats_heads != runtime_heads
@@ -272,7 +275,7 @@ def build_triattention_selector(
                 resolved_layer_idx=resolved_layer_idx,
                 target_heads=runtime_heads,
             )
-        return score_head_stats, score_freq_scale_sq, use_hf_group_max, group_size
+        return score_head_stats, score_freq_scale_sq, layer_omega, use_hf_group_max, group_size
 
     def _reduce_grouped_head_scores(
         *,
@@ -301,10 +304,24 @@ def build_triattention_selector(
         keys_dense: torch.Tensor,
         score_head_stats: dict[str, torch.Tensor],
         score_freq_scale_sq: torch.Tensor,
+        score_omega: torch.Tensor,
         use_hf_group_max: bool,
         group_size: int,
         round_start: int,
     ) -> torch.Tensor:
+        runtime_freq_count = int(keys_dense.shape[-1]) // 2
+        if runtime_freq_count <= 0:
+            raise RuntimeError("invalid_runtime_head_dim")
+        if int(score_freq_scale_sq.shape[-1]) != runtime_freq_count:
+            raise RuntimeError(
+                f"{TRITON_SCORING_REQUIRED_MARKER}:freq_scale_dim_mismatch:"
+                f"stats={int(score_freq_scale_sq.shape[-1])},runtime={runtime_freq_count}"
+            )
+        if int(score_omega.shape[-1]) != runtime_freq_count:
+            raise RuntimeError(
+                f"{TRITON_SCORING_REQUIRED_MARKER}:omega_dim_mismatch:"
+                f"stats={int(score_omega.shape[-1])},runtime={runtime_freq_count}"
+            )
         score_inputs = (
             keys_dense.repeat_interleave(group_size, dim=1).contiguous()
             if use_hf_group_max and group_size > 1
@@ -315,7 +332,7 @@ def build_triattention_selector(
                 key_states=score_inputs,
                 cache_positions=None,
                 head_stats=score_head_stats,
-                omega=compressor.omega,
+                omega=score_omega,
                 offsets=compressor.offsets,
                 freq_scale_sq=score_freq_scale_sq,
                 config=tri_cfg,
@@ -376,6 +393,7 @@ def build_triattention_selector(
         (
             score_head_stats,
             score_freq_scale_sq,
+            score_omega,
             use_hf_group_max,
             group_size,
         ) = _resolve_layer_score_inputs(
@@ -398,6 +416,7 @@ def build_triattention_selector(
                 keys_dense=keys_chunk,
                 score_head_stats=score_head_stats,
                 score_freq_scale_sq=score_freq_scale_sq,
+                score_omega=score_omega,
                 use_hf_group_max=use_hf_group_max,
                 group_size=group_size,
                 round_start=round_start,
@@ -486,6 +505,7 @@ def build_triattention_selector(
         (
             score_head_stats,
             score_freq_scale_sq,
+            score_omega,
             use_hf_group_max,
             group_size,
         ) = _resolve_layer_score_inputs(
@@ -519,6 +539,7 @@ def build_triattention_selector(
                     keys_dense=keys_chunk,
                     score_head_stats=score_head_stats,
                     score_freq_scale_sq=score_freq_scale_sq,
+                    score_omega=score_omega,
                     use_hf_group_max=use_hf_group_max,
                     group_size=group_size,
                     round_start=round_start,
@@ -577,6 +598,7 @@ def build_triattention_selector(
                     keys_dense=keys_chunk,
                     score_head_stats=score_head_stats,
                     score_freq_scale_sq=score_freq_scale_sq,
+                    score_omega=score_omega,
                     use_hf_group_max=use_hf_group_max,
                     group_size=group_size,
                     round_start=round_start,
@@ -829,6 +851,7 @@ def build_triattention_selector(
                 (
                     score_head_stats,
                     score_freq_scale_sq,
+                    score_omega,
                     use_hf_group_max,
                     group_size,
                 ) = _resolve_layer_score_inputs(
@@ -844,6 +867,7 @@ def build_triattention_selector(
                         "runtime_heads": runtime_heads,
                         "score_head_stats": score_head_stats,
                         "score_freq_scale_sq": score_freq_scale_sq,
+                        "score_omega": score_omega,
                         "use_hf_group_max": use_hf_group_max,
                         "group_size": group_size,
                     }
@@ -876,6 +900,7 @@ def build_triattention_selector(
                             keys_dense=keys_chunk,
                             score_head_stats=entry["score_head_stats"],
                             score_freq_scale_sq=entry["score_freq_scale_sq"],
+                            score_omega=entry["score_omega"],
                             use_hf_group_max=entry["use_hf_group_max"],
                             group_size=entry["group_size"],
                             round_start=round_start,
@@ -945,6 +970,7 @@ def build_triattention_selector(
                             keys_dense=keys_chunk,
                             score_head_stats=entry["score_head_stats"],
                             score_freq_scale_sq=entry["score_freq_scale_sq"],
+                            score_omega=entry["score_omega"],
                             use_hf_group_max=entry["use_hf_group_max"],
                             group_size=entry["group_size"],
                             round_start=round_start,

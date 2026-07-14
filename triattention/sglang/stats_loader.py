@@ -93,6 +93,11 @@ class StatsBundle:
         return self.head_dim // 2
 
     @property
+    def layer_freq_counts(self) -> list[int]:
+        raw = self.metadata.get("layer_freq_counts", [])
+        return [int(x) for x in raw] if isinstance(raw, (list, tuple)) else []
+
+    @property
     def rope_style(self) -> str:
         return str(self.metadata.get("rope_style", "half"))
 
@@ -171,8 +176,31 @@ def load_stats(
 
     num_layers = len(layer_nums)
     num_attention_heads = len(head_nums)
-    head_dim = rkv_metadata.get("head_dim", 128)
-    freq_count = head_dim // 2
+    layer_head_dims_raw = rkv_metadata.get("layer_head_dims")
+    layer_head_dims = (
+        {int(i): int(v) for i, v in enumerate(layer_head_dims_raw)}
+        if isinstance(layer_head_dims_raw, (list, tuple))
+        else {}
+    )
+
+    def _entry_freq_count(layer_idx: int) -> int:
+        for head_idx in sorted(head_nums):
+            entry = rkv_stats_raw.get(f"layer{layer_idx:02d}_head{head_idx:02d}")
+            if not isinstance(entry, dict):
+                continue
+            for stat_name in ("q_abs_mean", "q_mean_real", "q_mean_imag"):
+                value = entry.get(stat_name)
+                if isinstance(value, torch.Tensor):
+                    return int(value.numel())
+        if layer_idx in layer_head_dims:
+            return max(1, int(layer_head_dims[layer_idx]) // 2)
+        return int(rkv_metadata.get("head_dim", 128)) // 2
+
+    layer_freq_counts = {
+        int(layer_idx): _entry_freq_count(int(layer_idx)) for layer_idx in layer_nums
+    }
+    max_freq_count = max(layer_freq_counts.values()) if layer_freq_counts else 64
+    head_dim = max(int(rkv_metadata.get("head_dim", max_freq_count * 2)), max_freq_count * 2)
 
     # Compute GQA group size (do NOT aggregate)
     effective_num_kv_heads = num_kv_heads if num_kv_heads else num_attention_heads
@@ -183,10 +211,10 @@ def load_stats(
     inv_freq_raw = rkv_metadata.get("inv_freq")
     if isinstance(inv_freq_raw, torch.Tensor):
         omega = inv_freq_raw.to(device=device, dtype=torch.float32)
-        omega = omega[:freq_count].contiguous()
+        omega = omega[:max_freq_count].contiguous()
     elif isinstance(inv_freq_raw, (list, tuple)):
         omega = torch.tensor(inv_freq_raw, device=device, dtype=torch.float32)
-        omega = omega[:freq_count].contiguous()
+        omega = omega[:max_freq_count].contiguous()
     else:
         # Fallback: derive from model config
         model_id = rkv_metadata.get("model_name", rkv_metadata.get("model_path"))
@@ -206,47 +234,58 @@ def load_stats(
                 inv_freq = getattr(rotary, "inv_freq", None)
                 if isinstance(inv_freq, torch.Tensor):
                     omega = inv_freq.to(device=device, dtype=torch.float32)[
-                        :freq_count
+                        :max_freq_count
                     ].contiguous()
             except Exception:
                 pass
 
     # --- derive freq_scale_sq (shared across all heads, like HF) ---
-    freq_scale_sq: Optional[torch.Tensor] = None
     model_id = rkv_metadata.get("model_name", rkv_metadata.get("model_path"))
-    if model_id:
+
+    def _derive_freq_scale_sq(layer_freq_count: int) -> torch.Tensor:
         try:
             from transformers import AutoConfig
             from triattention.common.rope_utils import (
                 build_rotary,
                 compute_frequency_scaling,
             )
-            model_config = AutoConfig.from_pretrained(
-                str(model_id), trust_remote_code=True,
-            )
-            rotary = build_rotary(
-                cache_device=device,
-                model_path=Path(str(model_id)),
-                dtype=dtype,
-                config=model_config,
-            )
-            freq_scale = compute_frequency_scaling(
-                rotary=rotary,
-                head_dim=head_dim,
-                dtype=dtype,
-                device=device,
-            ).to(device=device, dtype=torch.float32)
-            freq_scale_sq = freq_scale.flatten().pow(2)  # [freq_count]
+            if model_id:
+                model_config = AutoConfig.from_pretrained(
+                    str(model_id), trust_remote_code=True,
+                )
+                rotary = build_rotary(
+                    cache_device=device,
+                    model_path=Path(str(model_id)),
+                    dtype=dtype,
+                    config=model_config,
+                )
+                freq_scale = compute_frequency_scaling(
+                    rotary=rotary,
+                    head_dim=layer_freq_count * 2,
+                    dtype=dtype,
+                    device=device,
+                ).to(device=device, dtype=torch.float32)
+                freq_scale_sq = freq_scale.flatten().pow(2)
+                if freq_scale_sq.numel() < layer_freq_count:
+                    padded = torch.ones(layer_freq_count, device=device, dtype=torch.float32)
+                    padded[: freq_scale_sq.numel()] = freq_scale_sq
+                    freq_scale_sq = padded
+                else:
+                    freq_scale_sq = freq_scale_sq[:layer_freq_count].contiguous()
+                return freq_scale_sq
         except Exception:
             pass
-    if freq_scale_sq is None:
-        freq_scale_sq = torch.ones(freq_count, device=device, dtype=torch.float32)
-    elif freq_scale_sq.numel() < freq_count:
-        padded = torch.ones(freq_count, device=device, dtype=torch.float32)
-        padded[: freq_scale_sq.numel()] = freq_scale_sq
-        freq_scale_sq = padded
-    else:
-        freq_scale_sq = freq_scale_sq[:freq_count].contiguous()
+        return torch.ones(layer_freq_count, device=device, dtype=torch.float32)
+
+    def _fit_1d(value: torch.Tensor, target: int, *, fill: float = 0.0) -> torch.Tensor:
+        value = value.flatten()
+        if value.numel() == target:
+            return value
+        if value.numel() > target:
+            return value[:target]
+        out = torch.full((target,), fill, device=value.device, dtype=value.dtype)
+        out[: value.numel()] = value
+        return out
 
     # --- build per-layer stats at attention-head granularity ---
     # Each layer stores tensors with dim-0 = num_attention_heads
@@ -257,6 +296,7 @@ def load_stats(
         all_q_mean_real = []
         all_q_mean_imag = []
         all_q_abs_mean = []
+        layer_freq_count = int(layer_freq_counts.get(layer_idx, max_freq_count))
 
         for head_idx in sorted(head_nums):
             key = f"layer{layer_idx:02d}_head{head_idx:02d}"
@@ -264,27 +304,39 @@ def load_stats(
                 head_data = rkv_stats_raw[key]
                 if "q_abs_mean" in head_data:
                     all_q_abs_mean.append(
-                        head_data["q_abs_mean"].to(device=device, dtype=torch.float32)
+                        _fit_1d(
+                            head_data["q_abs_mean"].to(device=device, dtype=torch.float32),
+                            layer_freq_count,
+                            fill=1.0,
+                        )
                     )
                 else:
                     all_q_abs_mean.append(
-                        torch.ones(freq_count, device=device, dtype=torch.float32)
+                        torch.ones(layer_freq_count, device=device, dtype=torch.float32)
                     )
                 if "q_mean_real" in head_data and "q_mean_imag" in head_data:
                     all_q_mean_real.append(
-                        head_data["q_mean_real"].to(device=device, dtype=torch.float32)
+                        _fit_1d(
+                            head_data["q_mean_real"].to(device=device, dtype=torch.float32),
+                            layer_freq_count,
+                        )
                     )
                     all_q_mean_imag.append(
-                        head_data["q_mean_imag"].to(device=device, dtype=torch.float32)
+                        _fit_1d(
+                            head_data["q_mean_imag"].to(device=device, dtype=torch.float32),
+                            layer_freq_count,
+                        )
                     )
 
         # Stack all attention heads WITHOUT GQA aggregation.
         # Shape: [num_attention_heads, freq_count]
         q_abs_mean_stacked = torch.stack(all_q_abs_mean, dim=0)
 
-        layer_entry: Dict[str, torch.Tensor] = {
+        freq_scale_sq = _derive_freq_scale_sq(layer_freq_count)
+        layer_entry: Dict[str, Any] = {
             "freq_scale_sq": freq_scale_sq.clone(),  # [freq_count] (shared)
             "q_abs_mean": q_abs_mean_stacked,  # [num_attention_heads, freq_count]
+            "freq_count": layer_freq_count,
         }
 
         if all_q_mean_real and all_q_mean_imag:
@@ -303,6 +355,14 @@ def load_stats(
         "num_kv_heads": effective_num_kv_heads,
         "head_dim": head_dim,
         "num_layers": num_layers,
+        "layer_head_dims": [
+            int(layer_head_dims.get(layer_idx, layer_freq_counts.get(layer_idx, max_freq_count) * 2))
+            for layer_idx in range(num_layers)
+        ],
+        "layer_freq_counts": [
+            int(layer_freq_counts.get(layer_idx, max_freq_count))
+            for layer_idx in range(num_layers)
+        ],
         "rope_style": rkv_metadata.get("rope_style", "half"),
         "rope_type": rkv_metadata.get("rope_type"),
         "rope_theta": rkv_metadata.get("rope_theta", 10000.0),
@@ -358,7 +418,17 @@ def validate_stats_against_model(
     """
     errors = []
 
-    if bundle.head_dim != model_head_dim:
+    layer_head_dims_raw = bundle.metadata.get("layer_head_dims", [])
+    layer_head_dims = (
+        [int(x) for x in layer_head_dims_raw]
+        if isinstance(layer_head_dims_raw, (list, tuple))
+        else []
+    )
+    model_head_dims = {int(model_head_dim)}
+    if layer_head_dims:
+        model_head_dims.add(max(layer_head_dims))
+
+    if bundle.head_dim not in model_head_dims:
         errors.append(
             f"head_dim mismatch: stats={bundle.head_dim}, "
             f"model={model_head_dim}"
@@ -400,10 +470,14 @@ def validate_stats_against_model(
     # Accept if tensor dim-0 == model_num_kv_heads (aggregated) or is
     # a multiple of model_num_kv_heads (attention-head granularity).
     for layer_idx, layer_data in bundle.head_stats.items():
+        expected_freq = (
+            int(layer_head_dims[layer_idx]) // 2
+            if layer_idx < len(layer_head_dims)
+            else int(model_head_dim) // 2
+        )
         q_mean = layer_data.get("q_mean_complex")
         if q_mean is not None:
             actual_heads = q_mean.shape[0]
-            expected_freq = model_head_dim // 2
             if actual_heads != model_num_kv_heads and (
                 actual_heads == 0 or model_num_kv_heads == 0
                 or actual_heads % model_num_kv_heads != 0
@@ -424,7 +498,6 @@ def validate_stats_against_model(
         if freq_sq is not None:
             # freq_scale_sq can be 1D [freq_count] (shared)
             # or 2D [num_heads, freq_count].
-            expected_freq = model_head_dim // 2
             if freq_sq.dim() == 1:
                 if freq_sq.shape[0] != expected_freq:
                     errors.append(
@@ -447,8 +520,6 @@ def validate_stats_against_model(
                         f"layer {layer_idx} freq_scale_sq freq dim "
                         f"{freq_sq.shape[-1]} != expected {expected_freq}"
                     )
-        # Only check the first layer with stats to avoid verbose output.
-        break
 
     if errors:
         raise ValueError(

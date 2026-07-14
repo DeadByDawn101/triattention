@@ -54,9 +54,11 @@ class TriAttentionCompressor:
         # RoPE frequencies
         self.inv_freq: Optional[torch.Tensor] = None
         self.omega: Optional[torch.Tensor] = None
+        self.layer_inv_freq: Dict[int, torch.Tensor] = {}
+        self.layer_omega: Dict[int, torch.Tensor] = {}
 
         # Frequency scaling factors
-        self.freq_scale_sq: Optional[torch.Tensor] = None
+        self.freq_scale_sq: Optional[Dict[int, torch.Tensor]] = None
 
         # Precomputed offsets for scoring
         self.offsets: Optional[torch.Tensor] = None
@@ -124,11 +126,14 @@ class TriAttentionCompressor:
         2) derive inv_freq from the real model config when model_path is available;
         3) fallback to metadata/legacy rope_theta-based construction.
         """
+        layer_freq_counts = self._layer_freq_counts()
+        layer_head_dims = self._layer_head_dims()
+        heterogeneous_layers = len(set(layer_head_dims.values())) > 1
         inv_freq_raw = self.metadata.get("inv_freq")
         if isinstance(inv_freq_raw, torch.Tensor):
             inv_freq = inv_freq_raw.to(device=self.config.device, dtype=torch.float32)
             expected_freq_count = int(self.config.head_dim) // 2
-            if inv_freq.numel() < expected_freq_count:
+            if inv_freq.numel() < expected_freq_count and not heterogeneous_layers:
                 raise ValueError(
                     "metadata.inv_freq has fewer elements than required by "
                     f"head_dim={self.config.head_dim}: got {inv_freq.numel()}, "
@@ -142,7 +147,7 @@ class TriAttentionCompressor:
                 dtype=torch.float32,
             )
             expected_freq_count = int(self.config.head_dim) // 2
-            if inv_freq.numel() < expected_freq_count:
+            if inv_freq.numel() < expected_freq_count and not heterogeneous_layers:
                 raise ValueError(
                     "metadata.inv_freq has fewer elements than required by "
                     f"head_dim={self.config.head_dim}: got {inv_freq.numel()}, "
@@ -192,6 +197,33 @@ class TriAttentionCompressor:
         # Match HF/R-KV reference scoring semantics: use rotary inv_freq directly.
         # The scoring formula expects the same frequency basis as the model's RoPE.
         self.omega = self.inv_freq
+        self.layer_inv_freq = {}
+        self.layer_omega = {}
+        layer_inv_freqs_raw = self.metadata.get("layer_inv_freqs")
+        rope_theta = self.metadata.get("rope_theta", 10000.0)
+        for layer_idx, layer_freq_count in layer_freq_counts.items():
+            layer_inv_freq = None
+            if isinstance(layer_inv_freqs_raw, (list, tuple)) and layer_idx < len(layer_inv_freqs_raw):
+                raw = layer_inv_freqs_raw[layer_idx]
+                if isinstance(raw, torch.Tensor):
+                    layer_inv_freq = raw.to(device=self.config.device, dtype=torch.float32)
+                elif isinstance(raw, (list, tuple)):
+                    layer_inv_freq = torch.tensor(raw, device=self.config.device, dtype=torch.float32)
+            if layer_inv_freq is None and not heterogeneous_layers and isinstance(self.inv_freq, torch.Tensor):
+                layer_inv_freq = self.inv_freq
+            if layer_inv_freq is None:
+                layer_inv_freq = compute_rope_frequencies(
+                    layer_head_dims.get(layer_idx, layer_freq_count * 2),
+                    rope_theta=rope_theta,
+                    device=self.config.device,
+                )
+            if layer_inv_freq.numel() < layer_freq_count:
+                raise ValueError(
+                    f"Layer {layer_idx} inv_freq has {layer_inv_freq.numel()} values, "
+                    f"expected at least {layer_freq_count}"
+                )
+            self.layer_inv_freq[layer_idx] = layer_inv_freq[:layer_freq_count].contiguous()
+            self.layer_omega[layer_idx] = self.layer_inv_freq[layer_idx]
 
     def _precompute_freq_scale(self):
         """Precompute frequency scaling factors from stats.
@@ -201,23 +233,76 @@ class TriAttentionCompressor:
         """
         num_layers = self.config.num_layers
         num_kv_heads = self.config.num_kv_heads
-        freq_count = self.config.head_dim // 2
-
-        # Allocate freq_scale_sq tensor
-        self.freq_scale_sq = torch.zeros(
-            num_layers,
-            num_kv_heads,
-            freq_count,
-            device=self.config.device,
-            dtype=self.config.compute_dtype,
-        )
+        self.freq_scale_sq = {}
 
         # Fill from head_stats
         for layer_idx in range(num_layers):
             if layer_idx in self.head_stats:
                 layer_data = self.head_stats[layer_idx]
                 if "freq_scale_sq" in layer_data:
-                    self.freq_scale_sq[layer_idx] = layer_data["freq_scale_sq"]
+                    freq_scale_sq = layer_data["freq_scale_sq"].to(
+                        device=self.config.device,
+                        dtype=self.config.compute_dtype,
+                    )
+                    if freq_scale_sq.dim() == 1:
+                        freq_scale_sq = freq_scale_sq.unsqueeze(0).expand(
+                            num_kv_heads, -1
+                        ).contiguous()
+                    self.freq_scale_sq[layer_idx] = freq_scale_sq
+
+    def _layer_freq_counts(self) -> Dict[int, int]:
+        raw = self.metadata.get("layer_freq_counts") if self.metadata else None
+        if isinstance(raw, (list, tuple)):
+            return {idx: int(value) for idx, value in enumerate(raw)}
+        counts: Dict[int, int] = {}
+        if self.head_stats:
+            for layer_idx, layer_data in self.head_stats.items():
+                q_mean = layer_data.get("q_mean_complex")
+                q_abs = layer_data.get("q_abs_mean")
+                freq_sq = layer_data.get("freq_scale_sq")
+                if isinstance(q_mean, torch.Tensor):
+                    counts[int(layer_idx)] = int(q_mean.shape[-2])
+                elif isinstance(q_abs, torch.Tensor):
+                    counts[int(layer_idx)] = int(q_abs.shape[-1])
+                elif isinstance(freq_sq, torch.Tensor):
+                    counts[int(layer_idx)] = int(freq_sq.shape[-1])
+        if counts:
+            return counts
+        return {
+            idx: int(self.config.head_dim) // 2
+            for idx in range(int(self.config.num_layers))
+        }
+
+    def _layer_head_dims(self) -> Dict[int, int]:
+        raw = self.metadata.get("layer_head_dims") if self.metadata else None
+        if isinstance(raw, (list, tuple)):
+            return {idx: int(value) for idx, value in enumerate(raw)}
+        return {
+            layer_idx: freq_count * 2
+            for layer_idx, freq_count in self._layer_freq_counts().items()
+        }
+
+    def get_layer_omega(self, layer_idx: int) -> torch.Tensor:
+        self._lazy_init()
+        resolved = int(layer_idx)
+        if resolved not in self.layer_omega:
+            keys = sorted(self.layer_omega)
+            if not keys:
+                raise RuntimeError("layer_omega_not_initialized")
+            resolved = keys[resolved % len(keys)]
+        return self.layer_omega[resolved]
+
+    def get_layer_freq_scale_sq(self, layer_idx: int) -> torch.Tensor:
+        self._lazy_init()
+        if self.freq_scale_sq is None:
+            raise RuntimeError("freq_scale_sq_not_initialized")
+        resolved = int(layer_idx)
+        if resolved not in self.freq_scale_sq:
+            keys = sorted(self.freq_scale_sq)
+            if not keys:
+                raise RuntimeError("freq_scale_sq_empty")
+            resolved = keys[resolved % len(keys)]
+        return self.freq_scale_sq[resolved]
 
     def _init_offsets(self):
         """Initialize scoring offsets.
@@ -252,6 +337,8 @@ class TriAttentionCompressor:
             return
 
         if self.offsets is None or self.omega is None:
+            return
+        if len({int(omega.numel()) for omega in self.layer_omega.values()}) > 1:
             return
 
         max_seq_len = self.config.trig_cache_max_seq_len
@@ -375,9 +462,9 @@ class TriAttentionCompressor:
             key_states=key_states,
             cache_positions=None,  # Not used in scoring
             head_stats=layer_stats,
-            omega=self.omega,
+            omega=self.get_layer_omega(layer_idx),
             offsets=self.offsets,
-            freq_scale_sq=self.freq_scale_sq[layer_idx],
+            freq_scale_sq=self.get_layer_freq_scale_sq(layer_idx),
             config=self.config,
             round_start=round_start,
             trig_cache=self.trig_cache,

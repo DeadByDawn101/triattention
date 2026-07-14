@@ -127,11 +127,29 @@ def score_layer_hf_aligned(
         )
 
     # Slice stats to local shard's attention heads.
-    q_mean_complex_local = layer_stats_full["q_mean_complex"][head_start:head_end]
-    q_abs_mean_local = layer_stats_full["q_abs_mean"][head_start:head_end]
+    runtime_freq_count = int(layer_k.shape[-1]) // 2
+    if runtime_freq_count <= 0:
+        raise RuntimeError("invalid_runtime_head_dim")
+    layer_omega = compressor.get_layer_omega(layer_idx)
+    if int(layer_omega.shape[-1]) != runtime_freq_count:
+        raise RuntimeError(
+            f"omega_dim_mismatch:stats={int(layer_omega.shape[-1])},"
+            f"runtime={runtime_freq_count}"
+        )
+    q_mean_complex_local = layer_stats_full["q_mean_complex"][
+        head_start:head_end, :, :
+    ].contiguous()
+    q_abs_mean_local = layer_stats_full["q_abs_mean"][
+        head_start:head_end, :
+    ].contiguous()
 
     # freq_scale_sq is shared across heads -- expand to local head count.
     freq_scale_sq_1d = layer_stats_full["freq_scale_sq"]  # [freq_count]
+    if int(freq_scale_sq_1d.shape[-1]) != runtime_freq_count:
+        raise RuntimeError(
+            f"freq_scale_dim_mismatch:stats={int(freq_scale_sq_1d.shape[-1])},"
+            f"runtime={runtime_freq_count}"
+        )
     freq_scale_sq_expanded = freq_scale_sq_1d.unsqueeze(0).expand(
         num_attention_heads_local, -1
     ).contiguous()
@@ -148,7 +166,7 @@ def score_layer_hf_aligned(
         key_states=layer_k_expanded,
         cache_positions=None,
         head_stats=head_stats_for_scoring,
-        omega=compressor.omega,
+        omega=layer_omega,
         offsets=compressor.offsets,
         freq_scale_sq=freq_scale_sq_expanded,
         config=compressor.config,
