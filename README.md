@@ -37,6 +37,7 @@ https://github.com/user-attachments/assets/768e59bb-897e-41bf-81b8-e7376aa72056
 
 ## News
 
+- **[2026-08-04]** TriAttention is now officially integrated into [NVIDIA TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) as a KV-cache compression method ([NVIDIA/TensorRT-LLM#16957](https://github.com/NVIDIA/TensorRT-LLM/pull/16957)). See the [TensorRT-LLM TriAttention guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md).
 - **[2026-04-21]** SGLang backend support added — TriAttention now runs on SGLang in addition to vLLM. See [SGLang Integration](docs/sglang.md).
 - **[2026-04-14]** Community DGX Spark (GB10/sm-121) enablement by [@dscain](https://github.com/dscain) — vLLM support merged, non-vLLM path in progress.
 - **[2026-04-12]** TriAttention now supports AR video generation with KV cache compression. See [LongLive README](longlive/README.md).
@@ -48,6 +49,7 @@ https://github.com/user-attachments/assets/768e59bb-897e-41bf-81b8-e7376aa72056
 - **2.5x throughput** on AIME25 long reasoning while matching Full Attention accuracy (40.8 vs 40.8)
 - **10.7x KV memory reduction** with trigonometric frequency-domain compression
 - **OpenClaw compatible** — enables local deployment on 24GB RTX 4090
+- **Officially integrated into NVIDIA TensorRT-LLM** — see [TensorRT-LLM Integration](#tensorrt-llm-integration)
 
 <p align="center">
   <img src="docs/assets/tradeoff.png" width="80%">
@@ -261,10 +263,15 @@ print(outputs[0].outputs[0].text)
 
 TriAttention requires precomputed Q/K frequency statistics for scoring. We provide pre-calibrated stats for supported models in `triattention/vllm/stats/`. See the [Calibration Guide](docs/calibration.md) for generating stats for custom models.
 
+## TensorRT-LLM Integration
+
+TriAttention is officially supported in [NVIDIA TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) as a KV-cache compression method ([NVIDIA/TensorRT-LLM#16957](https://github.com/NVIDIA/TensorRT-LLM/pull/16957)). For installation, configuration, and usage, follow the official [TensorRT-LLM TriAttention guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md). The required calibration file is generated with this repository — see the [Calibration Guide](docs/calibration.md).
+
 ## Roadmap
 
 - [x] vLLM integration
-- [ ] SGLang integration
+- [x] SGLang integration
+- [x] TensorRT-LLM integration (official upstream support)
 - [ ] Ollama integration
 - [ ] Support for more model architectures
 
